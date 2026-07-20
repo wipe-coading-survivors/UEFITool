@@ -448,6 +448,13 @@ USTATUS UEFIEdit::rebuild(const UString & guidStr)
     USTATUS result = ffsOps->rebuild(index);
     if (result)
         return result;
+    // Mark all ancestors for rebuild so the change propagates to the root.
+    // Without this, buildVolume/buildFile with NoAction on a parent returns the
+    // original bytes verbatim and the rebuilt child is never written out.
+    for (UModelIndex p = index.parent(); p.isValid() && model->type(p) != Types::Root; p = p.parent()) {
+        if (model->action(p) == Actions::NoAction)
+            model->setAction(p, Actions::Rebuild);
+    }
     UModelIndex root = model->index(0, 0);
     if (root.isValid() && model->action(root) == Actions::NoAction)
         model->setAction(root, Actions::Rebuild);

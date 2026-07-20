@@ -260,3 +260,9 @@ UEFIEdit/UEFIEdit
 *.o.d
 build/
 .opencode/
+
+# UEFIExtract output artifacts (never commit dumps/reports into fw/)
+*.bin.dump/
+*.bin.dump
+*.bin.report.txt
+*.bin.guids.csv

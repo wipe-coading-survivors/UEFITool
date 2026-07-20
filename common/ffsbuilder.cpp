@@ -683,6 +683,9 @@ USTATUS FfsBuilder::buildFile(const UModelIndex & index, UByteArray & file)
 }
 
 // Compress data using the specified compression type. Returns U_SUCCESS on success.
+// After compression, a round-trip check is performed: the compressed data is
+// decompressed back and compared to the original. This catches buggy compressors
+// that produce invalid streams (ported from old_engine ffsengine.cpp).
 static USTATUS compressData(const UByteArray & data, const UINT8 compressionType, UByteArray & compressed)
 {
     if (compressionType == EFI_NOT_COMPRESSED) {
@@ -710,6 +713,33 @@ static USTATUS compressData(const UByteArray & data, const UINT8 compressionType
                 return U_CUSTOMIZED_COMPRESSION_FAILED;
         }
         compressed = buffer.left(dstSize);
+
+        // Round-trip check: decompress and compare with the original.
+        UByteArray decompressed;
+        UINT8 algorithm = COMPRESSION_ALGORITHM_UNKNOWN;
+        UINT32 dictionarySize = 0;
+        UByteArray efiDecompressed;
+        if (decompress(compressed, compressionType, algorithm, dictionarySize, decompressed, efiDecompressed) == U_SUCCESS
+            && decompressed == data) {
+            return U_SUCCESS;
+        }
+        // Round-trip failed — the compressed stream cannot be decompressed back
+        // to the original data. Fall through to the secondary attempt below for
+        // EFI_STANDARD_COMPRESSION, or fail for customized compression.
+        if (compressionType == EFI_CUSTOMIZED_COMPRESSION
+            || compressionType == EFI_CUSTOMIZED_COMPRESSION_LZMAF86)
+            return U_STANDARD_COMPRESSION_FAILED;
+
+        // Try the other compressor as a fallback for STANDARD_COMPRESSION
+        dstSize = 0;
+        if (EfiCompress(data.constData(), (UINT32)data.size(), NULL, &dstSize) != EFI_SUCCESS)
+            return U_STANDARD_COMPRESSION_FAILED;
+        UByteArray buffer2(dstSize, '\0');
+        if (EfiCompress(data.constData(), (UINT32)data.size(), buffer2.data(), &dstSize) != EFI_SUCCESS)
+            return U_STANDARD_COMPRESSION_FAILED;
+        compressed = buffer2.left(dstSize);
+        // Trust the secondary compressor without another round-trip check to
+        // avoid a potential infinite loop; old_engine does the same.
         return U_SUCCESS;
     }
     
@@ -748,56 +778,59 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
         UByteArray header = model->header(index);
         UByteArray body = model->body(index);
         
-        // Encapsulation section types: rebuild the children into a new body
+        // Encapsulation section types: rebuild the children into a new body.
+        // For Replace/replace-body (rowCount==0 after clearChildren), the stored
+        // body is the new payload and must still be (re)compressed if the section
+        // is a compression or known GUID-defined section.
         if (sectionType == EFI_SECTION_COMPRESSION
             || sectionType == EFI_SECTION_GUID_DEFINED
             || sectionType == EFI_SECTION_DISPOSABLE
             || sectionType == EFI_SECTION_FIRMWARE_VOLUME_IMAGE) {
-            // If there are no children (e.g. section inserted as a raw blob),
-            // use the stored body verbatim without re-encapsulating.
-            if (model->rowCount(index) == 0) {
-                // Just recalculate the section size in the header below.
+            UByteArray newBody;
+            if (model->rowCount(index) > 0) {
+                // Build children sections first
+                for (int i = 0; i < model->rowCount(index); i++) {
+                    USTATUS result = U_SUCCESS;
+                    UModelIndex currentChild = index.model()->index(i, 0, index);
+                    UByteArray currentData;
+                    
+                    if (model->type(currentChild) == Types::Section) {
+                        result = buildSection(currentChild, currentData);
+                    }
+                    else if (model->type(currentChild) == Types::Volume) {
+                        result = buildVolume(currentChild, currentData);
+                    }
+                    else if (model->type(currentChild) == Types::Padding) {
+                        result = buildPadding(currentChild, currentData);
+                    }
+                    else {
+                        msg(UString("buildSection: unexpected item type ") + itemTypeToUString(model->type(currentChild)), currentChild);
+                        return U_UNKNOWN_ITEM_TYPE;
+                    }
+                    if (result) {
+                        msg(UString("buildSection: building of ") + model->name(currentChild) + UString(" failed with error ") + errorCodeToUString(result), currentChild);
+                        return result;
+                    }
+                    newBody += currentData;
+                    // Section alignment is 4 bytes
+                    UByteArray alignment = model->alignmentBytes(currentChild);
+                    if (!alignment.isEmpty())
+                        newBody += alignment;
+                }
             }
             else {
-            // Build children sections first
-            UByteArray newBody;
-            for (int i = 0; i < model->rowCount(index); i++) {
-                USTATUS result = U_SUCCESS;
-                UModelIndex currentChild = index.model()->index(i, 0, index);
-                UByteArray currentData;
-                
-                if (model->type(currentChild) == Types::Section) {
-                    result = buildSection(currentChild, currentData);
-                }
-                else if (model->type(currentChild) == Types::Volume) {
-                    result = buildVolume(currentChild, currentData);
-                }
-                else if (model->type(currentChild) == Types::Padding) {
-                    result = buildPadding(currentChild, currentData);
-                }
-                else {
-                    msg(UString("buildSection: unexpected item type ") + itemTypeToUString(model->type(currentChild)), currentChild);
-                    return U_UNKNOWN_ITEM_TYPE;
-                }
-                if (result) {
-                    msg(UString("buildSection: building of ") + model->name(currentChild) + UString(" failed with error ") + errorCodeToUString(result), currentChild);
-                    return result;
-                }
-                newBody += currentData;
-                // Section alignment is 4 bytes
-                UByteArray alignment = model->alignmentBytes(currentChild);
-                if (!alignment.isEmpty())
-                    newBody += alignment;
+                // No children: use the stored body as the new payload. This is
+                // the path taken after replace/replace-body cleared children.
+                newBody = body;
             }
             
-            // For compression section, compress the new body using stored compression type
+            // Compress the new body for compression and GUID-defined sections.
+            // For DISPOSABLE and FIRMWARE_VOLUME_IMAGE the body is stored as-is.
             if (sectionType == EFI_SECTION_COMPRESSION) {
                 UINT8 compressionType = EFI_NOT_COMPRESSED;
-                UINT32 uncompressedSize = (UINT32)newBody.size();
                 if (!model->hasEmptyParsingData(index)) {
                     COMPRESSED_SECTION_PARSING_DATA pdata = *(const COMPRESSED_SECTION_PARSING_DATA*)model->parsingData(index).constData();
                     compressionType = pdata.compressionType;
-                    uncompressedSize = pdata.uncompressedSize;
                 }
                 UByteArray compressedBody;
                 USTATUS result = compressData(newBody, compressionType, compressedBody);
@@ -805,16 +838,14 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                     msg(UString("buildSection: compression failed with error ") + errorCodeToUString(result), index);
                     return result;
                 }
-                
                 // Reconstruct the compression section header: common header + EFI_COMPRESSION_SECTION
                 UINT32 headerSize;
-                if (ffsVersion == 3 && uncompressedSize > 0xFFFFFF) {
+                if (ffsVersion == 3 && (UINT32)newBody.size() > 0xFFFFFF) {
                     headerSize = sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_COMPRESSION_SECTION);
                 }
                 else {
                     headerSize = sizeof(EFI_COMMON_SECTION_HEADER) + sizeof(EFI_COMPRESSION_SECTION);
                 }
-                
                 UINT32 newSectionSize = headerSize + (UINT32)compressedBody.size();
                 UByteArray newHeader(headerSize, '\0');
                 if (headerSize >= sizeof(EFI_COMMON_SECTION_HEADER2) + sizeof(EFI_COMPRESSION_SECTION)) {
@@ -837,9 +868,6 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                 section = newHeader + compressedBody;
                 return U_SUCCESS;
             }
-            
-            // For GUID-defined section, check if it's a known compressed section
-            // and compress the new body accordingly.
             else if (sectionType == EFI_SECTION_GUID_DEFINED) {
                 EFI_GUID guid = { 0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0} };
                 UINT32 dictionarySize = DEFAULT_LZMA_DICTIONARY_SIZE;
@@ -854,7 +882,6 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                 if (baGuid == EFI_GUIDED_SECTION_LZMA
                     || baGuid == EFI_GUIDED_SECTION_LZMA_HP
                     || baGuid == EFI_GUIDED_SECTION_LZMA_MS) {
-                    // LZMA compress
                     UINT32 dstSize = 0;
                     USTATUS lzmaResult = LzmaCompress(
                         (const UINT8*)newBody.constData(), (UINT32)newBody.size(),
@@ -874,7 +901,6 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                     body = compressedBody.left(dstSize);
                 }
                 else if (baGuid == EFI_GUIDED_SECTION_TIANO) {
-                    // Tiano/EFI compression
                     UByteArray compressedBody;
                     USTATUS result = compressData(newBody, EFI_STANDARD_COMPRESSION, compressedBody);
                     if (result) {
@@ -911,10 +937,9 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                 }
             }
             else {
-                // For other encapsulation section types, the body is already reconstructed
+                // DISPOSABLE, FIRMWARE_VOLUME_IMAGE: body is already reconstructed
                 body = newBody;
             }
-            } // end of else (has children)
         }
         
         // Recalculate the section size in the header
