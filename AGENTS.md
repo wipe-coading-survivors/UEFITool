@@ -62,8 +62,8 @@ UEFI-tools/                      (корень git-репозитория = фо
 
 | Файл | Назначение |
 |------|-----------|
-| `uefiedit.h/cpp` | Класс `UEFIEdit` |
-| `uefiedit_main.cpp` | CLI-парсер |
+| `uefiedit.h/cpp` | Класс `UEFIEdit`: `Target` (Guid/Path/GuidSection), `parseTarget`, `resolveTarget`, `findItem`, `findSectionByTypeRecursive` |
+| `uefiedit_main.cpp` | CLI-парсер: `dump`/`list`/`save`/`insert*`/`remove`/`replace*`/`rebuild` |
 | `uefiedit.pro` | qmake (без Qt) |
 | `CMakeLists.txt` | cmake |
 | `meson.build` | meson |
@@ -185,6 +185,28 @@ for (UModelIndex p = index.parent(); p.isValid() && model->type(p) != Types::Roo
 
 Это позволяет заменять FFS-файлы с LZMA-сжатыми GUIDed-секциями (например, Setup-модуль AMI BIOS). Подробно — в IMPLEMENTATION.md, баг 10.
 
+### `buildSection` сжимает body в общем пути (P1.2)
+
+`FfsBuilder::buildSection` для инкапсулирующих секций (`EFI_SECTION_COMPRESSION`, `EFI_SECTION_GUID_DEFINED`, `EFI_SECTION_DISPOSABLE`, `EFI_SECTION_FIRMWARE_VOLUME_IMAGE`) собирает `newBody` из детей при `rowCount > 0`, либо берёт `model->body(index)` при `rowCount == 0` (после `clearChildren` в `replace`/`replace-body`). Сжатие выполняется **всегда**, независимо от `rowCount` — это позволяет `replace-body` сжатой секции корректно пересжимать тело.
+
+### Универсальная адресация элементов (P2)
+
+Все команды `UEFIEdit` (`insert`/`insert-before`/`insert-after`/`remove`/`replace`/`replace-body`/`rebuild`) принимают `TARGET` — строку, адресующую элемент дерева одним из трёх способов:
+
+| Формат | Пример | Описание |
+|--------|--------|----------|
+| **GUID** | `5C60F367-A505-419A-859E-2A4FF6CA6FE5` | Поиск по GUID: File (header GUID), Volume (`extendedHeaderGuid` из parsingData), GUIDed/Freeform-section (GUID из parsingData) |
+| **Путь** | `0/2/2/27/1/0` | Спуск по дереву: первый элемент — root (всегда `0`), остальные — индексы детей. Выводится в `dump` и `list` |
+| **GUID:тип[:N]** | `899407D7-...:0x10` или `899407D7-...:0x10:2` | Найти файл по GUID, затем N-ную (0-индекс, по умолчанию 0) секцию указанного типа (hex) |
+
+Парсер `parseTarget` различает форматы: строка из цифр и `/` → Path; строка с `:` после GUID → GuidSection; иначе → GUID. `resolveTarget` диспетчеризует поиск. `findSectionByTypeRecursive` обходит дерево с DFS-подсчётом вхождений.
+
+`dump` пишет в **stdout** с префиксом пути для копирования. `list` выводит TSV-таблицу (`path<TAB>type<TAB>subtype<TAB>guid<TAB>offset<TAB>size<TAB>name`) в stdout для скриптов.
+
+### Баг парсера: GUIDed-секция теряла GUID в parsingData (P2)
+
+`FfsParser::parseGuidDefinedSection` (два места: строка 3017 и 3465) дважды вызывает `setParsingData`. Первый раз — с `guid`, но без `dictionarySize`. Второй раз — с `dictionarySize`, но **без** `guid` (занулив его). Из-за этого `FfsBuilder::buildSection` не мог определить алгоритм сжатия (GUID был нулевой) и пересборка GUIDed-секций не работала. Фикс: второй `setParsingData` теперь сохраняет `guid` в `pdata.guid`.
+
 ### Контрольные суммы FFS
 
 При любой модификации файла (`buildFile` с `Rebuild`/`Replace`/`Insert`) пересчитываются:
@@ -215,58 +237,53 @@ for (UModelIndex p = index.parent(); p.isValid() && model->type(p) != Types::Roo
 | `899407D7-99FE-43D8-9A21-79EC328CAC21` | File | Setup (DXE driver, содержит LZMA GUIDed-секцию `EE4E5898-...`) — цель для replace с пересжатием |
 | `EE4E5898-3914-4259-9D6E-DC7BD79403CF` | Section GUID | AMI LZMA GUIDed-секция внутри Setup — проверка LZMA-компрессии при rebuild |
 
-### Регрессионные тесты (запускать после изменений в builder/ops)
+### Тестовые скрипты
+
+Три bash-скрипта в `tests/` покрывают smoke-проверки, регрессии и адресацию:
+
+| Скрипт | Тестов | Назначение | Когда запускать |
+|--------|--------|-----------|-----------------|
+| `tests/smoke.sh` | 10 | Быстрые проверки: rebuild=identity, insert/remove, GUI headless, dump | После каждой сборки |
+| `tests/regression.sh` | 9 | Глубокие проверки: clearChildren (byte flip), LZMA round-trip, rebuild-cascade | Перед коммитом |
+| `tests/p2_addressing.sh` | 12 | Адресация: dump/list TSV, path==GUID, GUID:sectionType, invalid targets | После изменений в UEFIEdit |
+
+Все скрипты самодостаточны: берут `UEFIEdit`/`UEFITool`/BIOS из путей по умолчанию, создают temp-каталог, требуют только `python3` (для манипуляций с байтами в regression). Запуск:
 
 ```bash
-cd /tmp/opencode
+tests/smoke.sh        # exit 0 = все 10 прошли
+tests/regression.sh   # exit 0 = все 9 прошли
+tests/p2_addressing.sh # exit 0 = все 12 прошли
+```
 
-# 1. Rebuild без изменений = идентичность
-UEFIEdit .../fw/HNX99TF_*.bin save /tmp/t1.bin && cmp /tmp/t1.bin .../fw/HNX99TF_*.bin && echo OK
+Старые ручные тесты (AGENTS.md до P2) сохранены в `tests/regression.sh` как тесты 1-5, 8-9. Тесты 6-7 (clearChildren, LZMA round-trip) автоматизированы в `tests/regression.sh` через python3-хелпер.
 
-# 2. Insert + extract = идентичность извлечённого
-UEFIEdit .../fw/HNX99TF_*.bin insert-after A0327FE0-... .../fw/Mashinist_DXE_driver_SerialIo_SerialIo.ffs save /tmp/t2.bin
-UEFIExtract /tmp/t2.bin all
-cat "/tmp/t2.bin.dump/2 BIOS region/2 5C60F367-.../215 SerialIo/header.bin" \
-    "/tmp/t2.bin.dump/2 BIOS region/2 5C60F367-.../215 SerialIo/body.bin" > /tmp/extracted.ffs
-cmp /tmp/extracted.ffs .../fw/Mashinist_DXE_driver_SerialIo_SerialIo.ffs && echo OK
+### Примеры использования UEFIEdit
 
-# 3. Insert + Remove = идентичность оригиналу
-UEFIEdit .../fw/HNX99TF_*.bin insert-after A0327FE0-... SerialIo.ffs remove 97C81E5D-... save /tmp/t3.bin
-cmp /tmp/t3.bin .../fw/HNX99TF_*.bin && echo OK
+```bash
+# Dump дерева в stdout (с путями для адресации)
+UEFIEdit bios.bin dump
 
-# 4. Remove Volume
-UEFIEdit .../fw/HNX99TF_*.bin remove 5C60F367-... save /tmp/t4.bin && echo OK
+# TSV-листинг для скриптов
+UEFIEdit bios.bin list > items.tsv
 
-# 5. Цепочка операций
-UEFIEdit .../fw/HNX99TF_*.bin \
+# Rebuild файла по GUID
+UEFIEdit bios.bin rebuild 899407D7-99FE-43D8-9A21-79EC328CAC21 save out.bin
+
+# Rebuild PE32-секции по пути (0/2/2/27/1/0 — из dump/list)
+UEFIEdit bios.bin rebuild 0/2/2/27/1/0 save out.bin
+
+# Rebuild PE32-секции по GUID:тип (0x10 = EFI_SECTION_PE32)
+UEFIEdit bios.bin rebuild 899407D7-99FE-43D8-9A21-79EC328CAC21:0x10 save out.bin
+
+# Replace-body секции (PE32 внутри Setup)
+UEFIEdit bios.bin replace-body 899407D7-99FE-43D8-9A21-79EC328CAC21:0x10 new_pe32.bin save out.bin
+
+# Цепочка операций
+UEFIEdit bios.bin \
   insert 5C60F367-... SerialIo.ffs \
   insert-after A0327FE0-... TerminalSrc.ffs \
   remove 97C81E5D-... \
-  save /tmp/t5.bin && echo OK
-
-# 6. Replace FFS с изменённым байтом (проверка clearChildren)
-# test_ffs3.bin = оригинальный FFS Setup с одним инвертированным байтом в body
-UEFIEdit .../fw/HNX99TF_*.bin replace 899407D7-99FE-43D8-9A21-79EC328CAC21 test_ffs3.bin save /tmp/t6.bin
-cmp /tmp/t6.bin .../fw/HNX99TF_*.bin  # должны различаться
-
-# 7. Replace FFS с LZMA GUIDed-секцией (увеличение размера + пересжатие)
-# new_setup_ffs.bin = FFS с новым PE32 (98208 байт) в LZMA GUIDed-секции
-UEFIEdit .../fw/HNX99TF_*.bin replace 899407D7-99FE-43D8-9A21-79EC328CAC21 new_setup_ffs.bin save /tmp/t7.bin
-# Проверка: FFS size вырос, LZMA-секция сжата, декомпрессия восстанавливает данные
-python3 -c "
-import struct, lzma
-data = open('/tmp/t7.bin','rb').read()
-pos = 0x8D1746  # GUIDed section offset in Setup FFS
-sec_size = struct.unpack('<I', data[pos:pos+4])[0] & 0xFFFFFF
-body = data[pos+24:pos+sec_size]
-props = body[0:5]; compressed = body[13:]
-pb,lp,lc = props[0]//45%5, props[0]//9%5, props[0]%9
-ds = struct.unpack('<I', props[1:5])[0]
-dec = lzma.decompress(compressed, format=lzma.FORMAT_RAW,
-    filters=[{'id':lzma.FILTER_LZMA1,'dict_size':ds,'lc':lc,'lp':lp,'pb':pb}])
-assert len(dec) == 98244, f'decompressed size {len(dec)} != 98244'
-print('LZMA round-trip OK')
-"
+  save out.bin
 ```
 
 ## Git
@@ -280,8 +297,13 @@ print('LZMA round-trip OK')
 
 - **Нет компрессии Brotli/GZip/Zlib для GUIDed-секций при rebuild**: `buildSection` сжимает только LZMA (`EFI_GUIDED_SECTION_LZMA`/`LZMA_HP`/`LZMA_MS`/`LZMAF86`) и Tiano (`EFI_GUIDED_SECTION_TIANO`) GUIDed-секции. Brotli, GZip, Zlib — только декомпрессия; при rebuild body используется как есть.
 - **Нет x86 BCJ пост-фильтра для LZMAF86**: `EFI_GUIDED_SECTION_LZMAF86` сжимается через plain `LzmaCompress` без BCJ-фильтра. Большинство прошивок принимает это, но теоретически возможны несовместимости.
+- **LZMA не идемпотентен**: `rebuild` секции внутри LZMA GUIDed-секции пересжимает тело. Даже без изменения данных результат может отличаться от оригинала (разные версии LZMA-компрессора дают разные потоки). `rebuild` **файла** (не секции) = identity, т.к. `buildFile` не пересжимает GUIDed-секции с `NoAction`.
 - **Нет переименования UI-секций**: поле `EFI_SECTION_USER_INTERFACE` (имя файла) не обновляется при insert.
 - **Нет обновления FIT-таблицы**: при вставке/удалении микрокода FIT не пересчитывается.
 - **Нет проверки свободного места перед вставкой**: `buildVolume` сообщает об ошибке только при сохранении, а не при insert.
+- **Нет rebase PEI-модулей**: при insert/remove PEI-файлов базы PE32/TE не пересчитываются (нет `rebase`/`patchVtf` из old_engine).
+- **Нет VTF-обработки**: Volume Top File не перемещается в конец тома при rebuild.
+- **Нет `growVolume`**: если вставляемый FFS не помещается (нет FreeSpace) — `buildVolume` возвращает ошибку, volume не увеличивается.
 - **Нет undo/redo** в GUI.
 - **Builder messages dock** в GUI отключён (`enableDock(ui->builderMessagesDock, false)` в конструкторе) — можно включить для отладки.
+- **Нет `extract`/`extract-body` в UEFIEdit**: для извлечения используйте `UEFIExtract` (отдельная утилита).

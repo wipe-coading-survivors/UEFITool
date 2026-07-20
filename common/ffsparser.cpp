@@ -3463,6 +3463,7 @@ USTATUS FfsParser::parseGuidedSectionBody(const UModelIndex & index)
     
     // Set parsing data
     GUIDED_SECTION_PARSING_DATA pdata = {};
+    pdata.guid = guid;
     pdata.dictionarySize = dictionarySize;
     model->setParsingData(index, UByteArray((const char*)&pdata, sizeof(pdata)));
     

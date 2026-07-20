@@ -6,15 +6,15 @@ are licensed and made available under the terms and conditions of the BSD Licens
 which accompanies this distribution.  The full text of the license may be found at
 http://opensource.org/licenses/bsd-license.php
 
-THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
-WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
-
+THE PROGRAM IS DISTRIBUTED ON THE BSD LICENSE ON AN "AS IS" BASIS,
+WITHWARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 */
 
 #include "uefiedit.h"
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <sstream>
 
 UEFIEdit::UEFIEdit()
 {
@@ -79,7 +79,6 @@ USTATUS UEFIEdit::save(const UString & outputPath)
 // (case-insensitive, dashes optional) into an EFI_GUID.
 static bool parseGuidString(const UString & s, EFI_GUID & guid)
 {
-    // Make a normalized copy: lowercase, no dashes, must be 32 hex chars
     std::string normalized;
     const char *p = s.toLocal8Bit();
     for (; *p; ++p) {
@@ -126,7 +125,6 @@ UModelIndex UEFIEdit::findItemByGuidRecursive(const UModelIndex & parent, const 
     if (!parent.isValid())
         return UModelIndex();
 
-    // Files: GUID is the first field of the FFS file header
     if (model->type(parent) == Types::File && !model->hasEmptyHeader(parent)) {
         UByteArray hdr = model->header(parent);
         if ((UINT32)hdr.size() >= sizeof(EFI_GUID)) {
@@ -136,9 +134,6 @@ UModelIndex UEFIEdit::findItemByGuidRecursive(const UModelIndex & parent, const 
         }
     }
 
-    // Volumes: the displayed name comes from the extended header's FvName GUID
-    // (stored in VOLUME_PARSING_DATA.extendedHeaderGuid), not from FileSystemGuid
-    // which is the FFS version GUID (e.g. 8C8CE578 for FFSv2).
     if (model->type(parent) == Types::Volume && !model->hasEmptyParsingData(parent)) {
         UByteArray pdata = model->parsingData(parent);
         if ((UINT32)pdata.size() >= sizeof(VOLUME_PARSING_DATA)) {
@@ -148,7 +143,6 @@ UModelIndex UEFIEdit::findItemByGuidRecursive(const UModelIndex & parent, const 
         }
     }
 
-    // GUID-defined sections and freeform GUID sections: the GUID is in parsingData
     if (model->type(parent) == Types::Section && !model->hasEmptyParsingData(parent)) {
         UByteArray pdata = model->parsingData(parent);
         if ((UINT32)pdata.size() >= sizeof(EFI_GUID)) {
@@ -169,53 +163,146 @@ UModelIndex UEFIEdit::findItemByGuidRecursive(const UModelIndex & parent, const 
 UModelIndex UEFIEdit::findItemByGuid(const UString & guidStr)
 {
     EFI_GUID guid;
-    if (!parseGuidString(guidStr, guid)) {
-        std::cerr << "Invalid GUID: " << guidStr.toLocal8Bit() << std::endl;
+    if (!parseGuidString(guidStr, guid))
         return UModelIndex();
-    }
     return findItemByGuidRecursive(model->index(0, 0), guid);
 }
 
-UModelIndex UEFIEdit::findFileByGuid(const UString & guidStr)
-{
-    UModelIndex idx = findItemByGuid(guidStr);
-    if (!idx.isValid()) {
-        std::cerr << "Item with GUID " << guidStr.toLocal8Bit() << " not found" << std::endl;
-    }
-    return idx;
-}
-
-static void dumpTreeRecursive(TreeModel * model, const UModelIndex & parent, int depth, int row)
+UModelIndex UEFIEdit::findSectionByTypeRecursive(const UModelIndex & parent, const UINT8 sectionType, int & index)
 {
     if (!parent.isValid())
-        return;
-    for (int i = 0; i < depth; ++i) std::cerr << "  ";
-    const char *typeName = "?";
-    UINT8 t = model->type(parent);
-    UINT8 st = model->subtype(parent);
-    if (t == Types::Capsule) typeName = "Capsule";
-    else if (t == Types::Image) typeName = "Image";
-    else if (t == Types::Region) typeName = "Region";
-    else if (t == Types::Padding) typeName = "Padding";
-    else if (t == Types::Volume) typeName = "Volume";
-    else if (t == Types::File) typeName = "File";
-    else if (t == Types::Section) typeName = "Section";
-    else if (t == Types::FreeSpace) typeName = "FreeSpace";
-    std::cerr << "[" << row << "] type=" << (int)t << " (" << typeName << ") subtype=" << (int)st
-              << " name='" << model->name(parent).toLocal8Bit() << "'"
-              << " action=" << (int)model->action(parent)
-              << " hdr=" << model->headerSize(parent)
-              << " body=" << model->bodySize(parent)
-              << " tail=" << model->tailSize(parent)
-              << " children=" << model->rowCount(parent)
-              << std::endl;
-    for (int i = 0; i < model->rowCount(parent); ++i)
-        dumpTreeRecursive(model, model->index(i, 0, parent), depth + 1, i);
+        return UModelIndex();
+
+    if (model->type(parent) == Types::Section && model->subtype(parent) == sectionType) {
+        if (index == 0)
+            return parent;
+        --index;
+    }
+
+    for (int i = 0; i < model->rowCount(parent); ++i) {
+        UModelIndex found = findSectionByTypeRecursive(model->index(i, 0, parent), sectionType, index);
+        if (found.isValid())
+            return found;
+    }
+    return UModelIndex();
 }
 
-void UEFIEdit::dumpTree()
+// Parse a target string into a Target descriptor.
+//   "GUID"                       -> Guid
+//   "0/2/207"                    -> Path (decimal child indices from root)
+//   "GUID:0x10"                  -> GuidSection (file GUID + section type, 0-based default)
+//   "GUID:0x10:2"               -> GuidSection with explicit occurrence index
+bool UEFIEdit::parseTarget(const UString & s, Target & t)
 {
-    dumpTreeRecursive(model, model->index(0, 0), 0, 0);
+    std::string str = s.toLocal8Bit();
+    if (str.empty())
+        return false;
+
+    // Path form: starts with a digit and contains only digits and '/'.
+    bool allDigitsAndSlashes = true;
+    for (char c : str) {
+        if (!((c >= '0' && c <= '9') || c == '/')) {
+            allDigitsAndSlashes = false;
+            break;
+        }
+    }
+    if (str[0] >= '0' && str[0] <= '9' && allDigitsAndSlashes && str.find('/') != std::string::npos) {
+        t.kind = Target::Path;
+        t.path.clear();
+        std::stringstream ss(str);
+        std::string item;
+        while (std::getline(ss, item, '/')) {
+            if (item.empty()) continue;
+            t.path.push_back(std::stoi(item));
+        }
+        return !t.path.empty();
+    }
+
+    // GUID:sectionType[:index] form: contains ':' after a GUID.
+    size_t colon = str.find(':');
+    if (colon != std::string::npos && colon >= 32) {
+        std::string guidPart = str.substr(0, colon);
+        std::string rest = str.substr(colon + 1);
+        if (!parseGuidString(UString(guidPart.c_str()), t.guid))
+            return false;
+        std::string secTypeStr, indexStr;
+        size_t colon2 = rest.find(':');
+        if (colon2 != std::string::npos) {
+            secTypeStr = rest.substr(0, colon2);
+            indexStr = rest.substr(colon2 + 1);
+        }
+        else {
+            secTypeStr = rest;
+            indexStr = "";
+        }
+        unsigned int st = 0;
+        std::stringstream ss;
+        if (secTypeStr.size() > 2 && secTypeStr[0] == '0' && (secTypeStr[1] == 'x' || secTypeStr[1] == 'X'))
+            ss << std::hex << secTypeStr.substr(2);
+        else
+            ss << std::hex << secTypeStr;
+        ss >> st;
+        t.sectionType = (UINT8)st;
+        int idx = 0;
+        if (!indexStr.empty())
+            idx = std::stoi(indexStr);
+        t.sectionIndex = idx < 0 ? 0 : idx;
+        t.kind = Target::GuidSection;
+        return true;
+    }
+
+    // Plain GUID form.
+    if (parseGuidString(s, t.guid)) {
+        t.kind = Target::Guid;
+        return true;
+    }
+
+    return false;
+}
+
+UModelIndex UEFIEdit::resolveTarget(const Target & t)
+{
+    if (t.kind == Target::Guid) {
+        return findItemByGuidRecursive(model->index(0, 0), t.guid);
+    }
+
+    if (t.kind == Target::Path) {
+        // The path format mirrors "dump"/"list" output: the first element is the
+        // root row (always 0), each subsequent element descends into a child.
+        if (t.path.empty())
+            return UModelIndex();
+        UModelIndex current = model->index(0, 0);
+        for (size_t i = 1; i < t.path.size(); ++i) {
+            int row = t.path[i];
+            if (row < 0 || row >= model->rowCount(current))
+                return UModelIndex();
+            current = model->index(row, 0, current);
+        }
+        return current;
+    }
+
+    if (t.kind == Target::GuidSection) {
+        UModelIndex fileIndex = findItemByGuidRecursive(model->index(0, 0), t.guid);
+        if (!fileIndex.isValid())
+            return UModelIndex();
+        int index = t.sectionIndex;
+        return findSectionByTypeRecursive(fileIndex, t.sectionType, index);
+    }
+
+    return UModelIndex();
+}
+
+UModelIndex UEFIEdit::findItem(const UString & target)
+{
+    Target t;
+    if (!parseTarget(target, t)) {
+        std::cerr << "Invalid target: " << target.toLocal8Bit() << std::endl;
+        return UModelIndex();
+    }
+    UModelIndex idx = resolveTarget(t);
+    if (!idx.isValid())
+        std::cerr << "Item '" << target.toLocal8Bit() << "' not found" << std::endl;
+    return idx;
 }
 
 // Read the data file and split into header+body depending on the target.
@@ -285,20 +372,17 @@ static bool readAndSplit(const UString & path, bool isFile, const UModelIndex & 
     }
 }
 
-USTATUS UEFIEdit::insert(const UString & guidStr, const UINT8 mode, const UString & dataPath)
+USTATUS UEFIEdit::insert(const UString & target, const UINT8 mode, const UString & dataPath)
 {
     if (!initDone)
         return U_INVALID_PARAMETER;
 
-    UModelIndex index = findFileByGuid(guidStr);
+    UModelIndex index = findItem(target);
     if (!index.isValid())
         return U_ITEM_NOT_FOUND;
 
-    // Determine the parent for action marking and the type of the new item.
-    // For PREPEND, the new item is added as a child of the selected item.
-    // For BEFORE/AFTER, the new item is added as a sibling of the selected item.
-    UModelIndex parentIndex;      // The logical parent (container) of the new item
-    UModelIndex refItem;          // The reference item for addItem (see TreeModel::addItem)
+    UModelIndex parentIndex;
+    UModelIndex refItem;
     UINT8 createMode;
     if (mode == CREATE_MODE_PREPEND) {
         parentIndex = index;
@@ -307,7 +391,7 @@ USTATUS UEFIEdit::insert(const UString & guidStr, const UINT8 mode, const UStrin
     }
     else if (mode == CREATE_MODE_BEFORE || mode == CREATE_MODE_AFTER) {
         parentIndex = index.parent();
-        refItem = index;  // addItem uses the ref item's parent as the container for BEFORE/AFTER
+        refItem = index;
         createMode = mode;
     }
     else {
@@ -372,7 +456,6 @@ USTATUS UEFIEdit::insert(const UString & guidStr, const UINT8 mode, const UStrin
     }
 
     model->setAction(newIndex, Actions::Insert);
-    // Mark ancestors for rebuild so changes propagate to the root.
     for (UModelIndex p = parentIndex; p.isValid() && model->type(p) != Types::Root; p = p.parent()) {
         if (model->action(p) == Actions::NoAction)
             model->setAction(p, Actions::Rebuild);
@@ -386,19 +469,18 @@ USTATUS UEFIEdit::insert(const UString & guidStr, const UINT8 mode, const UStrin
     return U_SUCCESS;
 }
 
-USTATUS UEFIEdit::remove(const UString & guidStr)
+USTATUS UEFIEdit::remove(const UString & target)
 {
     if (!initDone)
         return U_INVALID_PARAMETER;
 
-    UModelIndex index = findFileByGuid(guidStr);
+    UModelIndex index = findItem(target);
     if (!index.isValid())
         return U_ITEM_NOT_FOUND;
 
     USTATUS result = ffsOps->remove(index);
     if (result)
         return result;
-    // Mark all ancestors for rebuild so the removal propagates to the root.
     for (UModelIndex p = index.parent(); p.isValid() && model->type(p) != Types::Root; p = p.parent()) {
         if (model->action(p) == Actions::NoAction)
             model->setAction(p, Actions::Rebuild);
@@ -409,12 +491,12 @@ USTATUS UEFIEdit::remove(const UString & guidStr)
     return U_SUCCESS;
 }
 
-USTATUS UEFIEdit::replace(const UString & guidStr, const UINT8 mode, const UString & dataPath)
+USTATUS UEFIEdit::replace(const UString & target, const UINT8 mode, const UString & dataPath)
 {
     if (!initDone)
         return U_INVALID_PARAMETER;
 
-    UModelIndex index = findFileByGuid(guidStr);
+    UModelIndex index = findItem(target);
     if (!index.isValid())
         return U_ITEM_NOT_FOUND;
 
@@ -425,7 +507,6 @@ USTATUS UEFIEdit::replace(const UString & guidStr, const UINT8 mode, const UStri
     USTATUS result = ffsOps->replace(index, data, mode);
     if (result)
         return result;
-    // Mark all ancestors for rebuild so the replacement propagates to the root.
     for (UModelIndex p = index.parent(); p.isValid() && model->type(p) != Types::Root; p = p.parent()) {
         if (model->action(p) == Actions::NoAction)
             model->setAction(p, Actions::Rebuild);
@@ -436,21 +517,18 @@ USTATUS UEFIEdit::replace(const UString & guidStr, const UINT8 mode, const UStri
     return U_SUCCESS;
 }
 
-USTATUS UEFIEdit::rebuild(const UString & guidStr)
+USTATUS UEFIEdit::rebuild(const UString & target)
 {
     if (!initDone)
         return U_INVALID_PARAMETER;
 
-    UModelIndex index = findFileByGuid(guidStr);
+    UModelIndex index = findItem(target);
     if (!index.isValid())
         return U_ITEM_NOT_FOUND;
 
     USTATUS result = ffsOps->rebuild(index);
     if (result)
         return result;
-    // Mark all ancestors for rebuild so the change propagates to the root.
-    // Without this, buildVolume/buildFile with NoAction on a parent returns the
-    // original bytes verbatim and the rebuilt child is never written out.
     for (UModelIndex p = index.parent(); p.isValid() && model->type(p) != Types::Root; p = p.parent()) {
         if (model->action(p) == Actions::NoAction)
             model->setAction(p, Actions::Rebuild);
@@ -459,4 +537,99 @@ USTATUS UEFIEdit::rebuild(const UString & guidStr)
     if (root.isValid() && model->action(root) == Actions::NoAction)
         model->setAction(root, Actions::Rebuild);
     return U_SUCCESS;
+}
+
+static const char *typeName(UINT8 t)
+{
+    switch (t) {
+    case Types::Capsule:  return "Capsule";
+    case Types::Image:    return "Image";
+    case Types::Region:   return "Region";
+    case Types::Padding:  return "Padding";
+    case Types::Volume:   return "Volume";
+    case Types::File:      return "File";
+    case Types::Section:   return "Section";
+    case Types::FreeSpace: return "FreeSpace";
+    default:               return "?";
+    }
+}
+
+static void dumpTreeRecursive(TreeModel * model, const UModelIndex & parent,
+                               const std::string & path, int row)
+{
+    if (!parent.isValid())
+        return;
+    std::string curPath = path.empty() ? std::to_string(row) : path + "/" + std::to_string(row);
+    UINT8 t = model->type(parent);
+    UINT8 st = model->subtype(parent);
+    std::cout << curPath
+              << " type=" << (int)t << " (" << typeName(t) << ")"
+              << " subtype=" << (int)st
+              << " name='" << model->name(parent).toLocal8Bit() << "'"
+              << " action=" << (int)model->action(parent)
+              << " hdr=" << model->headerSize(parent)
+              << " body=" << model->bodySize(parent)
+              << " tail=" << model->tailSize(parent)
+              << " children=" << model->rowCount(parent)
+              << std::endl;
+    for (int i = 0; i < model->rowCount(parent); ++i)
+        dumpTreeRecursive(model, model->index(i, 0, parent), curPath, i);
+}
+
+void UEFIEdit::dumpTree()
+{
+    UModelIndex root = model->index(0, 0);
+    if (!root.isValid())
+        return;
+    std::cout << "0 type=" << (int)model->type(root) << " (" << typeName(model->type(root)) << ")"
+              << " name='" << model->name(root).toLocal8Bit() << "'"
+              << " children=" << model->rowCount(root) << std::endl;
+    for (int i = 0; i < model->rowCount(root); ++i)
+        dumpTreeRecursive(model, model->index(i, 0, root), "", i);
+}
+
+static void listTreeRecursive(TreeModel * model, const UModelIndex & parent,
+                              const std::string & path)
+{
+    if (!parent.isValid())
+        return;
+    UINT8 t = model->type(parent);
+    UINT8 st = model->subtype(parent);
+
+    // GUID column: file GUID, volume FvName, or GUIDed-section GUID if available.
+    std::string guid = "-";
+    if (t == Types::File && !model->hasEmptyHeader(parent)) {
+        UByteArray hdr = model->header(parent);
+        if ((UINT32)hdr.size() >= sizeof(EFI_GUID))
+            guid = guidToUString(*(const EFI_GUID *)hdr.constData()).toLocal8Bit();
+    }
+    else if (t == Types::Volume && !model->hasEmptyParsingData(parent)) {
+        UByteArray pdata = model->parsingData(parent);
+        if ((UINT32)pdata.size() >= sizeof(VOLUME_PARSING_DATA)) {
+            const VOLUME_PARSING_DATA *vpd = (const VOLUME_PARSING_DATA *)pdata.constData();
+            if (vpd->hasExtendedHeader)
+                guid = guidToUString(vpd->extendedHeaderGuid).toLocal8Bit();
+        }
+    }
+    else if (t == Types::Section && !model->hasEmptyParsingData(parent)) {
+        UByteArray pdata = model->parsingData(parent);
+        if ((UINT32)pdata.size() >= sizeof(EFI_GUID))
+            guid = guidToUString(*(const EFI_GUID *)pdata.constData()).toLocal8Bit();
+    }
+
+    std::cout << path << "\t" << typeName(t) << "\t" << (int)st << "\t"
+              << guid << "\t0x" << std::hex << model->offset(parent) << "\t0x"
+              << std::hex << model->fullSize(parent) << "\t"
+              << model->name(parent).toLocal8Bit() << std::endl;
+
+    for (int i = 0; i < model->rowCount(parent); ++i)
+        listTreeRecursive(model, model->index(i, 0, parent), path + "/" + std::to_string(i));
+}
+
+void UEFIEdit::listTree()
+{
+    std::cout << "path\ttype\tsubtype\tguid\toffset\tsize\tname" << std::endl;
+    UModelIndex root = model->index(0, 0);
+    if (root.isValid())
+        listTreeRecursive(model, root, "0");
 }

@@ -6,9 +6,8 @@ are licensed and made available under the terms and conditions of the BSD Licens
 which accompanies this distribution.  The full text of the license may be found at
 http://opensource.org/licenses/bsd-license.php
 
-THE PROGRAM IS DISTRIBUTED UNDER THE BSD LICENSE ON AN "AS IS" BASIS,
-WITHOUT WARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
-
+THE PROGRAM IS DISTRIBUTED ON THE BSD LICENSE ON AN "AS IS" BASIS,
+WITHWARRANTIES OR REPRESENTATIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED.
 */
 
 #include <iostream>
@@ -28,17 +27,23 @@ static void print_usage()
         << "Console utility for inserting/removing/replacing FFS files and sections in UEFI images." << std::endl
         << "Usage:" << std::endl
         << "  UEFIEdit {-h | --help | -v | --version}" << std::endl
-        << "  UEFIEdit imagefile dump                              - print parsed tree" << std::endl
+        << "  UEFIEdit imagefile dump                              - print parsed tree to stdout (with path prefixes)" << std::endl
+        << "  UEFIEdit imagefile list                             - print a TSV listing (path, type, subtype, guid, offset, size, name)" << std::endl
         << "  UEFIEdit imagefile save output.bin                   - save (rebuild) the current image" << std::endl
-        << "  UEFIEdit imagefile insert GUID file.ffs              - insert FFS file into the volume containing GUID" << std::endl
-        << "  UEFIEdit imagefile insert-before GUID file.ffs       - insert FFS file before the file with GUID" << std::endl
-        << "  UEFIEdit imagefile insert-after GUID file.ffs        - insert FFS file after the file with GUID" << std::endl
-        << "  UEFIEdit imagefile remove GUID                       - mark the file with GUID for removal" << std::endl
-        << "  UEFIEdit imagefile replace GUID file.ffs             - replace the file with GUID (full, as-is)" << std::endl
-        << "  UEFIEdit imagefile replace-body GUID file.bin        - replace the body of the file with GUID" << std::endl
-        << "  UEFIEdit imagefile rebuild GUID                      - mark the file with GUID for rebuild" << std::endl
+        << "  UEFIEdit imagefile insert TARGET file.ffs            - insert FFS file into the item containing TARGET" << std::endl
+        << "  UEFIEdit imagefile insert-before TARGET file.ffs     - insert FFS file before the item at TARGET" << std::endl
+        << "  UEFIEdit imagefile insert-after TARGET file.ffs      - insert FFS file after the item at TARGET" << std::endl
+        << "  UEFIEdit imagefile remove TARGET                    - mark the item at TARGET for removal" << std::endl
+        << "  UEFIEdit imagefile replace TARGET file.ffs          - replace the item at TARGET (full, as-is)" << std::endl
+        << "  UEFIEdit imagefile replace-body TARGET file.bin     - replace the body of the item at TARGET" << std::endl
+        << "  UEFIEdit imagefile rebuild TARGET                   - mark the item at TARGET for rebuild" << std::endl
         << std::endl
-        << "Multiple edit commands can be chained before \"save\". GUID format: XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX" << std::endl
+        << "TARGET selects an item and can be one of:" << std::endl
+        << "  GUID    e.g. 5C60F367-A505-419A-859E-2A4FF6CA6FE5    - find by GUID (File header, Volume FvName, GUIDed section)" << std::endl
+        << "  PATH    e.g. 0/2/207/1/0                             - descend the tree by child indices (see \"dump\"/\"list\")" << std::endl
+        << "  GUID:T  e.g. 899407D7-...:0x10                       - find file by GUID, then first section of type T (hex)" << std::endl
+        << "  GUID:T:N                                          - same, but the Nth (0-based) section of type T" << std::endl
+        << "Multiple edit commands can be chained before \"save\"." << std::endl
         << "Exit code is 0 on success, non-zero USTATUS code on failure." << std::endl;
 }
 
@@ -82,6 +87,11 @@ int main(int argc, char *argv[])
 
         if (cmd == UString("dump")) {
             editor.dumpTree();
+            i += 1;
+            continue;
+        }
+        if (cmd == UString("list")) {
+            editor.listTree();
             i += 1;
             continue;
         }
