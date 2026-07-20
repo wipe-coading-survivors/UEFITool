@@ -899,6 +899,16 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                         return U_CUSTOMIZED_COMPRESSION_FAILED;
                     }
                     body = compressedBody.left(dstSize);
+                    // Round-trip check: decompress and compare with the original.
+                    UByteArray decompressed;
+                    UINT8 algorithm = COMPRESSION_ALGORITHM_UNKNOWN;
+                    UINT32 dictSize = 0;
+                    UByteArray efiDecompressed;
+                    if (decompress(body, EFI_CUSTOMIZED_COMPRESSION, algorithm, dictSize, decompressed, efiDecompressed) != U_SUCCESS
+                        || decompressed != newBody) {
+                        msg(UString("buildSection: LZMA round-trip check failed, compressed stream is invalid"), index);
+                        return U_CUSTOMIZED_COMPRESSION_FAILED;
+                    }
                 }
                 else if (baGuid == EFI_GUIDED_SECTION_TIANO) {
                     UByteArray compressedBody;
@@ -930,6 +940,16 @@ USTATUS FfsBuilder::buildSection(const UModelIndex & index, UByteArray & section
                         return U_CUSTOMIZED_COMPRESSION_FAILED;
                     }
                     body = compressedBody.left(dstSize);
+                    // Round-trip check: decompress and compare with the original.
+                    UByteArray decompressed;
+                    UINT8 algorithm = COMPRESSION_ALGORITHM_UNKNOWN;
+                    UINT32 dictSize = 0;
+                    UByteArray efiDecompressed;
+                    if (decompress(body, EFI_CUSTOMIZED_COMPRESSION_LZMAF86, algorithm, dictSize, decompressed, efiDecompressed) != U_SUCCESS
+                        || decompressed != newBody) {
+                        msg(UString("buildSection: LZMAF86 round-trip check failed, compressed stream is invalid"), index);
+                        return U_CUSTOMIZED_COMPRESSION_FAILED;
+                    }
                 }
                 else {
                     // Unknown or non-compressing GUIDed section — use body as-is
